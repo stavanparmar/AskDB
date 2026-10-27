@@ -60,4 +60,6 @@ Try questions such as:
 
 ![AskDB preview](media/askdb-cover.png)
 
-[View the AskDB demo video](media/askdb-demo.mp4)
+![AskDB demo animation](media/askdb-demo.gif)
+
+[Download the original demo video](media/askdb-demo.mp4)
