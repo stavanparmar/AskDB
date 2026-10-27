@@ -1,7 +1,5 @@
 langchain>=0.3,<2
-langchain-openai>=0.2,<2
 SQLAlchemy>=2.0,<3
 streamlit>=1.37,<2
 pandas>=2.1,<4
-python-dotenv>=1,<2
 pytest>=8,<9

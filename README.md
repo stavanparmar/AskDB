@@ -33,8 +33,9 @@ generated rows across `customers`, `products`, and `orders`.
    Copy-Item .env.example .env
    ```
 
-   Set `OPENAI_API_KEY` in `.env`. The model defaults to `gpt-4o-mini`; change
-   `OPENAI_MODEL` there to select another model supported by your provider.
+   Set `ANTHROPIC_API_KEY` in `.env`. The model defaults to
+   `claude-3-5-sonnet-latest`; change `ANTHROPIC_MODEL` there to select another
+   Claude model available to your account.
 
 5. Launch the app:
 
@@ -57,6 +58,5 @@ Try questions such as:
 
 ## Screenshot
 
-Save an application screenshot as `screenshots/askdb.png` and embed it here:
-
-![AskDB application screenshot](screenshots/askdb.png)
+An application screenshot can be added at `screenshots/askdb.png`. The image is
+not included yet, so this section intentionally avoids a broken image link.

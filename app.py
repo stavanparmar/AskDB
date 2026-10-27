@@ -6,12 +6,12 @@ from typing import TypedDict
 
 import pandas as pd
 import streamlit as st
-from openai import OpenAIError
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
 from askdb.chain import (
     LLMConfigurationError,
+    LLMRequestError,
     generate_sql,
     summarize_result,
 )
@@ -153,7 +153,7 @@ def _answer_question(question: str, schema: str) -> ChatRecord:
     sql, results = _execute_with_retry(question, schema)
     try:
         summary = summarize_result(question, sql, results)
-    except (LLMConfigurationError, OpenAIError, ValueError):
+    except (LLMConfigurationError, LLMRequestError, ValueError):
         summary = ""
 
     return {
@@ -192,7 +192,7 @@ def main() -> None:
     try:
         with st.spinner("Generating and safely running your query..."):
             record = _answer_question(question, schema)
-    except (LLMConfigurationError, OpenAIError) as error:
+    except (LLMConfigurationError, LLMRequestError) as error:
         record = {
             "question": question,
             "sql": "",
