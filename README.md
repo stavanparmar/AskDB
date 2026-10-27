@@ -61,5 +61,3 @@ Try questions such as:
 ![AskDB preview](media/askdb-cover.png)
 
 ![AskDB demo animation](media/askdb-demo.gif)
-
-[Download the original demo video](media/askdb-demo.mp4)
