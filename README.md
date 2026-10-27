@@ -56,7 +56,8 @@ Try questions such as:
 4. Who are the top five customers by total spending?
 5. Which product categories have the most orders?
 
-## Screenshot
+## Screenshot and demo
 
-An application screenshot can be added at `screenshots/askdb.png`. The image is
-not included yet, so this section intentionally avoids a broken image link.
+![AskDB preview](media/askdb-cover.png)
+
+[View the AskDB demo video](media/askdb-demo.mp4)
