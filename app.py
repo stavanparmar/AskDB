@@ -1,22 +1,35 @@
-"""Streamlit chat interface for asking questions about the sample database."""
+"""Role-aware Streamlit chat interface for asking questions about AskDB."""
 
+import os
 from io import StringIO
-from pathlib import Path
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
+from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
+from askdb.audit import log_question
 from askdb.chain import (
     LLMConfigurationError,
     LLMRequestError,
     generate_sql,
     summarize_result,
 )
-from askdb.safety import SQLSafetyError
-from askdb.schema import describe_schema, run_readonly_query
+from askdb.permissions import (
+    PolicyConfigurationError,
+    RolePolicy,
+    SQLPermissionError,
+    load_policy,
+    validate,
+)
+from askdb.schema import (
+    create_readonly_engine,
+    describe_schema,
+    run_readonly_query,
+)
 from askdb.seed import DATABASE_PATH, create_database_engine, seed_database
 
 
@@ -28,45 +41,33 @@ class ChatRecord(TypedDict):
     summary: str
     result_json: str
     error: str
-
-
-class QueryExecutionError(RuntimeError):
-    """Raised when a generated query still fails after its retry."""
+    role: NotRequired[str]
+    error_title: NotRequired[str]
 
 
 @st.cache_resource
-def _database_engine() -> Engine:
-    """Create and seed the local sample database once per app process."""
-    engine = create_database_engine()
-    seed_database(engine)
-    return engine
+def _database_engine(role: str) -> Engine:
+    """Return a role-specific PostgreSQL or read-only sample SQLite engine."""
+    database_url = (
+        os.getenv(f"ASKDB_{role.upper()}_DATABASE_URL")
+        or os.getenv("ASKDB_DATABASE_URL")
+    )
+    if database_url:
+        engine = create_engine(database_url, pool_pre_ping=True)
+        if engine.dialect.name != "postgresql":
+            engine.dispose()
+            raise ValueError("ASKDB_DATABASE_URL must use PostgreSQL.")
+        return engine
+
+    writable_engine = create_database_engine()
+    try:
+        seed_database(writable_engine)
+    finally:
+        writable_engine.dispose()
+    return create_readonly_engine(DATABASE_PATH)
 
 
-def _execute_with_retry(question: str, schema: str) -> tuple[str, pd.DataFrame]:
-    """Generate and run a query, sending one execution error back to the model."""
-    previous_sql = ""
-    error_message = ""
-    for attempt in range(2):
-        sql = generate_sql(
-            question,
-            schema,
-            previous_sql=previous_sql,
-            error_message=error_message,
-        )
-        try:
-            results = run_readonly_query(DATABASE_PATH, sql)
-            return sql, results
-        except (SQLAlchemyError, SQLSafetyError) as error:
-            if attempt == 1:
-                raise QueryExecutionError(str(error)) from error
-            previous_sql = sql
-            error_message = str(error)[:500]
-    raise QueryExecutionError("The query could not be completed.")
-
-
-def _chart_columns(
-    results: pd.DataFrame,
-) -> tuple[str, str, str] | None:
+def _chart_columns(results: pd.DataFrame) -> tuple[str, str, str] | None:
     """Choose a chart type and its x/y columns when the result supports one."""
     numeric_columns = [
         column
@@ -99,7 +100,7 @@ def _chart_columns(
 
 
 def _render_chart(results: pd.DataFrame) -> None:
-    """Render a bar or line chart when the result has suitable columns."""
+    """Render a Plotly bar or line chart for suitable query results."""
     selection = _chart_columns(results)
     if selection is None:
         return
@@ -118,7 +119,8 @@ def _render_chart(results: pd.DataFrame) -> None:
             .sort_values(x_column)
         )
         if not chart_data.empty:
-            st.line_chart(chart_data.set_index(x_column)[[y_column]])
+            figure = px.line(chart_data, x=x_column, y=y_column, markers=True)
+            st.plotly_chart(figure, use_container_width=True, theme="streamlit")
         return
 
     chart_data = (
@@ -127,7 +129,8 @@ def _render_chart(results: pd.DataFrame) -> None:
         .sort_values(y_column, ascending=False)
         .head(30)
     )
-    st.bar_chart(chart_data, x=x_column, y=y_column)
+    figure = px.bar(chart_data, x=x_column, y=y_column)
+    st.plotly_chart(figure, use_container_width=True, theme="streamlit")
 
 
 def _render_record(record: ChatRecord) -> None:
@@ -135,49 +138,170 @@ def _render_record(record: ChatRecord) -> None:
     with st.chat_message("user"):
         st.markdown(record["question"])
     with st.chat_message("assistant"):
+        role = record.get("role", "analyst")
+        st.caption(f"Role: {role.title()}")
         if record["error"]:
-            st.error(record["error"])
+            with st.container(border=True):
+                st.error(record.get("error_title", "Request failed"))
+                st.write(record["error"])
             return
-        st.code(record["sql"], language="sql")
+
         if record["summary"]:
             st.write(record["summary"])
         else:
             st.warning("The query succeeded, but its summary could not be generated.")
         results = pd.read_json(StringIO(record["result_json"]), orient="split")
-        st.dataframe(results, use_container_width=True)
+        st.dataframe(
+            results.style.format(precision=2),
+            use_container_width=True,
+            hide_index=True,
+        )
         _render_chart(results)
+        with st.expander("SQL"):
+            st.code(record["sql"], language="sql")
 
 
-def _answer_question(question: str, schema: str) -> ChatRecord:
-    """Run a question through SQL generation, execution, and summarization."""
-    sql, results = _execute_with_retry(question, schema)
-    try:
-        summary = summarize_result(question, sql, results)
-    except (LLMConfigurationError, LLMRequestError, ValueError):
-        summary = ""
-
+def _error_record(
+    question: str,
+    role: str,
+    error: str,
+    title: str,
+) -> ChatRecord:
+    """Build the consistent chat response for a denied or failed request."""
     return {
         "question": question,
-        "sql": sql,
-        "summary": summary,
-        "result_json": results.to_json(orient="split", date_format="iso"),
-        "error": "",
+        "sql": "",
+        "summary": "",
+        "result_json": "",
+        "error": error,
+        "role": role,
+        "error_title": title,
     }
 
 
+def _answer_question(
+    question: str,
+    role: str,
+    policy: RolePolicy,
+) -> ChatRecord:
+    """Generate, authorize, audit, and run a question for the selected role."""
+    sql = ""
+    reason = ""
+    error_title = "Request failed"
+    audit_written = False
+    progress = st.status("Reading schema", expanded=True)
+    try:
+        with progress:
+            engine = _database_engine(role)
+            schema = describe_schema(engine, policy)
+            progress.write("Using only tables and columns allowed for this role.")
+
+            progress.update(label="Generating SQL", state="running")
+            generated_sql = generate_sql(question, schema)
+            sql = generated_sql
+            progress.write("SQL generated.")
+
+            progress.update(label="Checking permissions", state="running")
+            safe_sql = validate(generated_sql, policy, limit=100)
+            sql = safe_sql
+            log_question(question, sql, role, "allowed")
+            audit_written = True
+
+            progress.update(label="Running query", state="running")
+            results = run_readonly_query(engine, safe_sql)
+            try:
+                summary = summarize_result(question, safe_sql, results)
+            except (LLMConfigurationError, LLMRequestError, ValueError):
+                summary = ""
+
+            progress.update(label="Query complete", state="complete")
+            return {
+                "question": question,
+                "sql": safe_sql,
+                "summary": summary,
+                "result_json": results.to_json(orient="split", date_format="iso"),
+                "error": "",
+                "role": role,
+            }
+    except SQLPermissionError as error:
+        reason = str(error)
+        error_title = "Query blocked"
+        progress.update(label="Query blocked by permissions", state="error")
+    except (LLMConfigurationError, LLMRequestError) as error:
+        reason = str(error)
+        error_title = "Could not generate query"
+        progress.update(label="Could not generate the query", state="error")
+    except (SQLAlchemyError, ValueError) as error:
+        reason = str(error)
+        error_title = "Query failed"
+        progress.update(label="Could not run the query", state="error")
+    finally:
+        if not audit_written:
+            log_question(question, sql, role, "blocked", reason)
+
+    return _error_record(question, role, reason, error_title)
+
+
+def _render_access_panel(policy: RolePolicy) -> None:
+    """Show the selected role's permitted tables and columns in the sidebar."""
+    st.sidebar.subheader("Your access")
+    for table, columns in policy.tables.items():
+        st.sidebar.markdown(f"**{table}**")
+        st.sidebar.caption(", ".join(columns))
+
+
 def main() -> None:
-    """Render AskDB and process chat questions."""
+    """Render AskDB and process role-aware chat questions."""
     st.set_page_config(page_title="AskDB", page_icon="💬", layout="wide")
+    st.markdown(
+        """
+        <style>
+        [data-testid="stAppViewContainer"] .block-container {
+            padding-top: 1.8rem;
+            padding-bottom: 2rem;
+            max-width: 1200px;
+        }
+        [data-testid="stChatMessage"],
+        [data-testid="stDataFrame"],
+        [data-testid="stAlert"] {
+            border-radius: 14px;
+        }
+        [data-testid="stChatMessage"] {
+            padding: 0.9rem 1rem;
+            margin-bottom: 0.6rem;
+        }
+        [data-testid="stSidebar"] {
+            border-right: 1px solid var(--secondary-background-color);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     st.title("AskDB")
     st.write("Ask questions in plain English about the sample sales database.")
 
     try:
-        schema = describe_schema(_database_engine())
-    except SQLAlchemyError:
-        st.error("The sample database could not be initialized.")
-        return
+        policy_document = load_policy()
+    except PolicyConfigurationError as error:
+        st.error(str(error))
+        st.stop()
 
-    st.caption("Sample data: customers, products, and orders (500 records total).")
+    role_names = list(policy_document.roles)
+    role = st.sidebar.selectbox(
+        "Choose a role",
+        role_names,
+        format_func=str.title,
+    )
+    policy = policy_document.roles[role]
+    _render_access_panel(policy)
+    st.sidebar.info(
+        "The role selector is for this local demo. Production deployments must "
+        "derive the role from authenticated identity."
+    )
+
+    if st.session_state.get("askdb_history_role") not in (None, role):
+        st.session_state["askdb_history"] = []
+    st.session_state["askdb_history_role"] = role
     if "askdb_history" not in st.session_state:
         st.session_state["askdb_history"] = []
 
@@ -189,26 +313,7 @@ def main() -> None:
     if not question:
         return
 
-    try:
-        with st.spinner("Generating and safely running your query..."):
-            record = _answer_question(question, schema)
-    except (LLMConfigurationError, LLMRequestError) as error:
-        record = {
-            "question": question,
-            "sql": "",
-            "summary": "",
-            "result_json": "",
-            "error": str(error),
-        }
-    except QueryExecutionError:
-        record = {
-            "question": question,
-            "sql": "",
-            "summary": "",
-            "result_json": "",
-            "error": "The query failed after one retry. Try rephrasing your question.",
-        }
-
+    record = _answer_question(question, role, policy)
     history.append(record)
     _render_record(record)
 

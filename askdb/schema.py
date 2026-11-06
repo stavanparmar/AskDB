@@ -1,4 +1,4 @@
-"""Discover the database schema and execute bounded read-only queries."""
+"""Describe role-visible database schemas and run read-only queries."""
 
 import sqlite3
 from pathlib import Path
@@ -8,32 +8,63 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.pool import NullPool
 
-from askdb.safety import validate_select
+from askdb.permissions import RolePolicy
 
 
-def describe_schema(engine: Engine) -> str:
-    """Return a compact schema description with columns and relationships."""
+def describe_schema(engine: Engine, policy: RolePolicy) -> str:
+    """Return only columns and relationships visible to the selected role."""
     inspector = inspect(engine)
     descriptions = []
-    for table_name in sorted(inspector.get_table_names()):
+    available_tables = {
+        table.casefold(): table for table in inspector.get_table_names()
+    }
+    for policy_table in sorted(policy.tables):
+        table_name = available_tables.get(policy_table.casefold())
+        if table_name is None:
+            raise ValueError(f"Policy table {policy_table!r} is missing from the database.")
+
         columns = inspector.get_columns(table_name)
+        available_columns = {
+            column["name"].casefold(): column for column in columns
+        }
+        requested_columns = policy.tables[policy_table]
+        missing_columns = [
+            column
+            for column in requested_columns
+            if column.casefold() not in available_columns
+        ]
+        if missing_columns:
+            raise ValueError(
+                f"Policy columns {', '.join(missing_columns)} are missing "
+                f"from table {policy_table!r}."
+            )
         column_text = ", ".join(
-            f"{column['name']} {column['type']}" for column in columns
+            f"{available_columns[column.casefold()]['name']} "
+            f"{available_columns[column.casefold()]['type']}"
+            for column in requested_columns
         )
-        descriptions.append(f"{table_name} ({column_text})")
+        descriptions.append(f"{policy_table} ({column_text})")
 
         for foreign_key in inspector.get_foreign_keys(table_name):
-            source = ", ".join(foreign_key["constrained_columns"])
-            target = (
-                f"{foreign_key['referred_table']}."
-                f"{', '.join(foreign_key['referred_columns'])}"
-            )
-            descriptions.append(f"  Foreign key: {table_name}.{source} -> {target}")
+            target_table = foreign_key["referred_table"]
+            source_columns = foreign_key["constrained_columns"]
+            target_columns = foreign_key["referred_columns"]
+            target_policy = policy.tables.get(target_table)
+            if (
+                target_policy is not None
+                and all(column in requested_columns for column in source_columns)
+                and all(column in target_policy for column in target_columns)
+            ):
+                source = ", ".join(source_columns)
+                target = f"{target_table}.{', '.join(target_columns)}"
+                descriptions.append(
+                    f"  Foreign key: {policy_table}.{source} -> {target}"
+                )
 
     return "\n".join(descriptions)
 
 
-def _create_readonly_engine(database_path: Path) -> Engine:
+def create_readonly_engine(database_path: Path) -> Engine:
     """Create an SQLAlchemy engine backed by a read-only SQLite connection."""
     database_uri = f"{database_path.resolve().as_uri()}?mode=ro"
 
@@ -49,12 +80,17 @@ def _create_readonly_engine(database_path: Path) -> Engine:
     )
 
 
-def run_readonly_query(database_path: Path, sql: str) -> pd.DataFrame:
-    """Run a validated SELECT query and return at most the configured row cap."""
-    safe_sql = validate_select(sql)
-    engine = _create_readonly_engine(database_path)
+def run_readonly_query(database: Path | Engine, sql: str) -> pd.DataFrame:
+    """Run pre-authorized SQL using a read-only SQLite or PostgreSQL connection."""
+    owns_engine = isinstance(database, Path)
+    engine = create_readonly_engine(database) if owns_engine else database
     try:
         with engine.connect() as connection:
-            return pd.read_sql_query(text(safe_sql), connection)
+            if engine.dialect.name == "sqlite":
+                connection.exec_driver_sql("PRAGMA query_only = ON")
+            elif engine.dialect.name == "postgresql":
+                connection.exec_driver_sql("SET TRANSACTION READ ONLY")
+            return pd.read_sql_query(text(sql), connection)
     finally:
-        engine.dispose()
+        if owns_engine:
+            engine.dispose()

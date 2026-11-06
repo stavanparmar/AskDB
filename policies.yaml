@@ -1,0 +1,42 @@
+roles:
+  analyst:
+    tables:
+      customers:
+        - id
+        - name
+        - city
+        - signup_date
+      products:
+        - id
+        - name
+        - category
+        - price
+      orders:
+        - id
+        - customer_id
+        - product_id
+        - order_date
+        - quantity
+        - unit_price
+        - total
+  manager:
+    tables:
+      customers:
+        - id
+        - name
+        - email
+        - city
+        - signup_date
+      products:
+        - id
+        - name
+        - category
+        - price
+      orders:
+        - id
+        - customer_id
+        - product_id
+        - order_date
+        - quantity
+        - unit_price
+        - total

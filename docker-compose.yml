@@ -1,0 +1,24 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    profiles:
+      - postgres
+    environment:
+      POSTGRES_DB: askdb
+      POSTGRES_USER: askdb_admin
+      POSTGRES_PASSWORD: ${ASKDB_POSTGRES_ADMIN_PASSWORD:?Set ASKDB_POSTGRES_ADMIN_PASSWORD}
+      ASKDB_ANALYST_PASSWORD: ${ASKDB_ANALYST_PASSWORD:?Set ASKDB_ANALYST_PASSWORD}
+      ASKDB_MANAGER_PASSWORD: ${ASKDB_MANAGER_PASSWORD:?Set ASKDB_MANAGER_PASSWORD}
+    ports:
+      - "${ASKDB_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - askdb-postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/01-askdb.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U askdb_admin -d askdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  askdb-postgres-data:
