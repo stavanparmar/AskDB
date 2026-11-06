@@ -1,6 +1,7 @@
 """Describe role-visible database schemas and run read-only queries."""
 
 import sqlite3
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -80,17 +81,39 @@ def create_readonly_engine(database_path: Path) -> Engine:
     )
 
 
-def run_readonly_query(database: Path | Engine, sql: str) -> pd.DataFrame:
-    """Run pre-authorized SQL using a read-only SQLite or PostgreSQL connection."""
+def run_readonly_query(
+    database: Path | Engine,
+    sql: str,
+    timeout_seconds: float = 30.0,
+) -> pd.DataFrame:
+    """Run bounded, pre-authorized SQL through a read-only connection."""
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be greater than zero.")
     owns_engine = isinstance(database, Path)
     engine = create_readonly_engine(database) if owns_engine else database
     try:
         with engine.connect() as connection:
+            progress_handler = None
             if engine.dialect.name == "sqlite":
                 connection.exec_driver_sql("PRAGMA query_only = ON")
+                deadline = time.monotonic() + timeout_seconds
+                progress_handler = connection.connection.driver_connection
+                progress_handler.set_progress_handler(
+                    lambda: int(time.monotonic() >= deadline),
+                    1000,
+                )
             elif engine.dialect.name == "postgresql":
                 connection.exec_driver_sql("SET TRANSACTION READ ONLY")
-            return pd.read_sql_query(text(sql), connection)
+                timeout_ms = max(1, int(timeout_seconds * 1000))
+                connection.execute(
+                    text("SELECT set_config('statement_timeout', :timeout, true)"),
+                    {"timeout": f"{timeout_ms}ms"},
+                )
+            try:
+                return pd.read_sql_query(text(sql), connection)
+            finally:
+                if progress_handler is not None:
+                    progress_handler.set_progress_handler(None, 0)
     finally:
         if owns_engine:
             engine.dispose()

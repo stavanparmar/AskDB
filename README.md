@@ -10,15 +10,22 @@ outcome in a local audit table.
 ```mermaid
 flowchart LR
     U[User] --> UI[Streamlit chat and role selector]
-    UI --> P[policies.yaml]
-    P --> V[Pydantic policy validation]
-    UI --> L[LangChain SQL generation]
-    V -->|Allowed schema only| L
-    L --> Q[SQLGlot parse, qualify, and permission checks]
-    Q -->|Allowed| DB[SQLAlchemy read-only connection]
-    Q -->|Blocked| E[Blocked-query card]
-    DB --> UI
-    UI --> A[SQLite audit_log table]
+    UI --> G[LangGraph workflow]
+    P[policies.yaml] --> V[Pydantic policy validation]
+    V --> GS[get_schema]
+    G --> GS
+    GS -->|Allowed schema only| SQL[generate_sql]
+    SQL --> CP[check_permissions]
+    CP -->|Allowed| EX[execute]
+    CP -->|Permission error| RF[refuse]
+    EX -->|Success| SM[summarize]
+    EX -->|SQL error, first try| SQL
+    EX -->|SQL error, retry exhausted| RF
+    SM --> UI
+    RF --> UI
+    SM --> AL[SQLite audit_log]
+    RF --> AL
+    EX --> DB[SQLAlchemy read-only connection]
     DB -. Optional profile .-> PG[PostgreSQL role-specific views]
 ```
 
@@ -32,17 +39,24 @@ defines its permitted tables and columns:
 | Analyst | `customers`, `products`, `orders` | Not allowed |
 | Manager | `customers`, `products`, `orders` | Allowed |
 
-Before a query runs, AskDB:
+The LangGraph workflow runs these steps for each question:
 
-1. Sends only the selected role's allowed schema to the SQL generator.
+1. Reads only the selected role's allowed schema and passes it to the SQL
+   generator.
 2. Uses SQLGlot to parse one `SELECT`, reject comments and write statements,
    verify every table and column, qualify identifiers, and expand `SELECT *`
    to only permitted columns.
 3. Adds a 100-row limit when one is missing and caps a larger requested limit.
-4. Executes through a read-only SQLite connection by default. The optional
-   PostgreSQL profile also uses read-only roles, transactions, and views.
-5. Writes the question, SQL, selected role, timestamp, outcome (`allowed` or
-   `blocked`), and any denial reason to the local `audit_log` table.
+4. Refuses permission violations without retrying. Database execution errors
+   may trigger one new SQL-generation attempt with the previous SQL and error.
+5. Executes through a read-only SQLite connection by default, with a query
+   timeout. The optional PostgreSQL profile also uses read-only roles,
+   transactions, and views.
+6. Summarizes successful results and chooses a chart when appropriate. The UI
+   streams workflow progress as each node runs.
+7. Writes each completed workflow to the local `audit_log` table with the
+   question, SQL, role, timestamp, outcome (`allowed` or `blocked`), reason,
+   and number of SQL attempts.
 
 The role selector is a **local demo control, not authentication**. Anyone who
 can use the app can select either role. A production deployment must derive

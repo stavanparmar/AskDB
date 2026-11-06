@@ -1,4 +1,4 @@
-"""Persist submitted questions and permission outcomes in a local audit table."""
+"""Persist workflow attempts and outcomes in a local audit table."""
 
 from functools import lru_cache
 from pathlib import Path
@@ -15,6 +15,7 @@ from sqlalchemy import (
     Text,
     create_engine,
     func,
+    inspect,
 )
 from sqlalchemy.engine import Engine, URL
 
@@ -37,6 +38,7 @@ _audit_log = Table(
     Column("role", String(64), nullable=False),
     Column("status", String(16), nullable=False),
     Column("reason", Text),
+    Column("attempts", Integer, nullable=False, server_default="1"),
     CheckConstraint("status IN ('allowed', 'blocked')", name="ck_audit_status"),
 )
 
@@ -48,6 +50,14 @@ def _audit_engine(database_path: Path) -> Engine:
     url = URL.create("sqlite", database=str(database_path.resolve()))
     engine = create_engine(url)
     _metadata.create_all(engine)
+    if "attempts" not in {
+        column["name"] for column in inspect(engine).get_columns("audit_log")
+    }:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "ALTER TABLE audit_log "
+                "ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1"
+            )
     return engine
 
 
@@ -58,8 +68,11 @@ def log_question(
     status: Literal["allowed", "blocked"],
     reason: str = "",
     database_path: Path = DATABASE_PATH,
+    attempts: int = 1,
 ) -> None:
-    """Append one question and its authorization outcome to the audit table."""
+    """Append one workflow outcome, including its number of SQL attempts."""
+    if attempts < 1:
+        raise ValueError("attempts must be greater than zero.")
     with _audit_engine(database_path).begin() as connection:
         connection.execute(
             _audit_log.insert().values(
@@ -68,5 +81,6 @@ def log_question(
                 role=role,
                 status=status,
                 reason=reason,
+                attempts=attempts,
             )
         )

@@ -9,27 +9,14 @@ import plotly.express as px
 import streamlit as st
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
 
-from askdb.audit import log_question
-from askdb.chain import (
-    LLMConfigurationError,
-    LLMRequestError,
-    generate_sql,
-    summarize_result,
-)
+from askdb.graph import AskDBState, build_graph, initial_state
 from askdb.permissions import (
     PolicyConfigurationError,
     RolePolicy,
-    SQLPermissionError,
     load_policy,
-    validate,
 )
-from askdb.schema import (
-    create_readonly_engine,
-    describe_schema,
-    run_readonly_query,
-)
+from askdb.schema import create_readonly_engine
 from askdb.seed import DATABASE_PATH, create_database_engine, seed_database
 
 
@@ -43,6 +30,7 @@ class ChatRecord(TypedDict):
     error: str
     role: NotRequired[str]
     error_title: NotRequired[str]
+    chart: NotRequired[tuple[str, str, str] | None]
 
 
 @st.cache_resource
@@ -67,41 +55,11 @@ def _database_engine(role: str) -> Engine:
     return create_readonly_engine(DATABASE_PATH)
 
 
-def _chart_columns(results: pd.DataFrame) -> tuple[str, str, str] | None:
-    """Choose a chart type and its x/y columns when the result supports one."""
-    numeric_columns = [
-        column
-        for column in results.select_dtypes(include="number").columns
-        if column.lower() != "id" and not column.lower().endswith("_id")
-    ]
-    if not numeric_columns:
-        return None
-
-    date_columns = [
-        column
-        for column in results.columns
-        if "date" in column.lower() or "time" in column.lower()
-    ]
-    for column in date_columns:
-        converted = pd.to_datetime(results[column], errors="coerce")
-        if converted.notna().any():
-            return "line", column, numeric_columns[0]
-
-    category_columns = [
-        column
-        for column in results.select_dtypes(include=["object", "category"]).columns
-        if column.lower() != "id"
-        and not column.lower().endswith("_id")
-        and 1 < results[column].nunique(dropna=True) <= 50
-    ]
-    if category_columns:
-        return "bar", category_columns[0], numeric_columns[0]
-    return None
-
-
-def _render_chart(results: pd.DataFrame) -> None:
-    """Render a Plotly bar or line chart for suitable query results."""
-    selection = _chart_columns(results)
+def _render_chart(
+    results: pd.DataFrame,
+    selection: tuple[str, str, str] | None,
+) -> None:
+    """Render the chart selected by the query workflow."""
     if selection is None:
         return
 
@@ -156,7 +114,7 @@ def _render_record(record: ChatRecord) -> None:
             use_container_width=True,
             hide_index=True,
         )
-        _render_chart(results)
+        _render_chart(results, record.get("chart"))
         with st.expander("SQL"):
             st.code(record["sql"], language="sql")
 
@@ -184,62 +142,51 @@ def _answer_question(
     role: str,
     policy: RolePolicy,
 ) -> ChatRecord:
-    """Generate, authorize, audit, and run a question for the selected role."""
-    sql = ""
-    reason = ""
-    error_title = "Request failed"
-    audit_written = False
+    """Stream a query through the workflow and build its chat response."""
+    workflow = build_graph(_database_engine(role), {role: policy})
+    state = initial_state(question, role)
     progress = st.status("Reading schema", expanded=True)
-    try:
-        with progress:
-            engine = _database_engine(role)
-            schema = describe_schema(engine, policy)
-            progress.write("Using only tables and columns allowed for this role.")
+    labels = {
+        "get_schema": "Reading schema",
+        "generate_sql": "Generating SQL",
+        "check_permissions": "Checking permissions",
+        "execute": "Running query",
+        "summarize": "Summarizing result",
+        "refuse": "Could not complete query",
+    }
+    with progress:
+        for update in workflow.stream(state, stream_mode="updates"):
+            for node, values in update.items():
+                state.update(values)
+                progress.update(label=labels[node], state="running")
 
-            progress.update(label="Generating SQL", state="running")
-            generated_sql = generate_sql(question, schema)
-            sql = generated_sql
-            progress.write("SQL generated.")
+    if state["error_kind"]:
+        error_titles = {
+            "permission": "Query blocked",
+            "schema": "Could not read schema",
+            "llm": "Could not generate query",
+            "execution": "Query failed",
+            "summary": "Could not summarize query",
+        }
+        progress.update(label="Query could not be completed", state="error")
+        return _error_record(
+            question,
+            role,
+            state["summary"],
+            error_titles.get(state["error_kind"], "Request failed"),
+        )
 
-            progress.update(label="Checking permissions", state="running")
-            safe_sql = validate(generated_sql, policy, limit=100)
-            sql = safe_sql
-            log_question(question, sql, role, "allowed")
-            audit_written = True
-
-            progress.update(label="Running query", state="running")
-            results = run_readonly_query(engine, safe_sql)
-            try:
-                summary = summarize_result(question, safe_sql, results)
-            except (LLMConfigurationError, LLMRequestError, ValueError):
-                summary = ""
-
-            progress.update(label="Query complete", state="complete")
-            return {
-                "question": question,
-                "sql": safe_sql,
-                "summary": summary,
-                "result_json": results.to_json(orient="split", date_format="iso"),
-                "error": "",
-                "role": role,
-            }
-    except SQLPermissionError as error:
-        reason = str(error)
-        error_title = "Query blocked"
-        progress.update(label="Query blocked by permissions", state="error")
-    except (LLMConfigurationError, LLMRequestError) as error:
-        reason = str(error)
-        error_title = "Could not generate query"
-        progress.update(label="Could not generate the query", state="error")
-    except (SQLAlchemyError, ValueError) as error:
-        reason = str(error)
-        error_title = "Query failed"
-        progress.update(label="Could not run the query", state="error")
-    finally:
-        if not audit_written:
-            log_question(question, sql, role, "blocked", reason)
-
-    return _error_record(question, role, reason, error_title)
+    progress.update(label="Query complete", state="complete")
+    results = pd.DataFrame(state["rows"], columns=state["columns"])
+    return {
+        "question": question,
+        "sql": state["sql"],
+        "summary": state["summary"],
+        "result_json": results.to_json(orient="split", date_format="iso"),
+        "error": "",
+        "role": role,
+        "chart": state["chart"],
+    }
 
 
 def _render_access_panel(policy: RolePolicy) -> None:
